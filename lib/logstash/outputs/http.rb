@@ -180,7 +180,12 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
         acc
       end
     else
-      event.to_hash
+      k = '@timestamp'
+      h = {}
+      ts = event[k]
+      h[k] = ts if ts
+      h.merge!(event.to_hash)
+      h
     end
   end
 
