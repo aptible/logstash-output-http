@@ -180,7 +180,16 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
         acc
       end
     else
-      event.to_hash
+      # If the @timestamp key is present, make it the first key in the hash
+      # See: https://community.aptible.com/t/sumologic-timestamp-parsing/237
+      {}.tap do |h|
+        k = '@timestamp'
+        event_hash = event.to_hash
+        if (ts = event_hash.delete(k))
+          h[k] = ts
+        end
+        h.merge!(event_hash)
+      end
     end
   end
 
