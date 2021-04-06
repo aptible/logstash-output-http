@@ -22,10 +22,6 @@ Gem::Specification.new do |s|
   s.add_runtime_dependency "logstash-core-plugin-api", ">= 1.60", "<= 2.99"
   s.add_runtime_dependency "logstash-mixin-http_client", ">= 6.0.0", "< 8.0.0"
 
-  # Constrain Maticore dependency to less than 0.5.0 because of changes in the async handling
-  # see note in http.rb
-  s.add_runtime_dependency "manticore", "< 0.5.0"
-
   s.add_development_dependency 'logstash-devutils'
   s.add_development_dependency 'sinatra'
   s.add_development_dependency 'webrick'
