@@ -4,11 +4,24 @@ require "logstash/namespace"
 require "logstash/json"
 require "uri"
 require "logstash/plugin_mixins/http_client"
+require "zlib"
 
 class LogStash::Outputs::Http < LogStash::Outputs::Base
   include LogStash::PluginMixins::HttpClient
 
+  concurrency :shared
+
+  attr_accessor :is_batch
+
   VALID_METHODS = ["put", "post", "patch", "delete", "get", "head"]
+
+  RETRYABLE_MANTICORE_EXCEPTIONS = [
+    ::Manticore::Timeout,
+    ::Manticore::SocketException,
+    ::Manticore::ClientProtocolException,
+    ::Manticore::ResolutionFailure,
+    ::Manticore::SocketTimeout
+  ]
 
   # This output lets you send events to a
   # generic HTTP(S) endpoint
@@ -26,15 +39,12 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
   # URL to use
   config :url, :validate => :string, :required => :true
 
-  # DEPRECATED. Set 'ssl_certificate_validation' instead
-  config :verify_ssl, :validate => :boolean, :default => true, :deprecated => "Please use 'ssl_certificate_validation' instead. This option will be removed in a future release!"
-
   # The HTTP Verb. One of "put", "post", "patch", "delete", "get", "head"
   config :http_method, :validate => VALID_METHODS, :required => :true
 
   # Custom headers to use
   # format is `headers => ["X-My-Header", "%{host}"]`
-  config :headers, :validate => :hash
+  config :headers, :validate => :hash, :default => {}
 
   # Content type
   #
@@ -44,12 +54,23 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
   # * if format is "form", "application/x-www-form-urlencoded"
   config :content_type, :validate => :string
 
+  # Set this to false if you don't want this output to retry failed requests
+  config :retry_failed, :validate => :boolean, :default => true
+
+  # If encountered as response codes this plugin will retry these requests
+  config :retryable_codes, :validate => :number, :list => true, :default => [429, 500, 502, 503, 504]
+
+  # If you would like to consider some non-2xx codes to be successes
+  # enumerate them here. Responses returning these codes will be considered successes
+  config :ignorable_codes, :validate => :number, :list => true
+
   # This lets you choose the structure and parts of the event that are sent.
   #
   #
   # For example:
   # [source,ruby]
-  #    mapping => {"foo", "%{host}", "bar", "%{type}"}
+  #    mapping => {"foo" => "%{host}"
+  #               "bar" => "%{type}"}
   config :mapping, :validate => :hash
 
   # Set the format of the http body.
@@ -60,13 +81,14 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
   # If message, then the body will be the result of formatting the event according to message
   #
   # Otherwise, the event is sent as json.
-  config :format, :validate => ["json", "form", "message"], :default => "json"
+  config :format, :validate => ["json", "json_batch", "form", "message"], :default => "json"
+
+  # Set this to true if you want to enable gzip compression for your http requests
+  config :http_compression, :validate => :boolean, :default => false
 
   config :message, :validate => :string
 
   def register
-    # Handle this deprecated option. TODO: remove the option
-    @ssl_certificate_validation = @verify_ssl if @verify_ssl
     @http_method = @http_method.to_sym
 
     # We count outstanding requests with this queue
@@ -82,82 +104,199 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
       case @format
         when "form" ; @content_type = "application/x-www-form-urlencoded"
         when "json" ; @content_type = "application/json"
+        when "json_batch" ; @content_type = "application/json"
         when "message" ; @content_type = "text/plain"
       end
     end
 
+    @is_batch = @format == "json_batch"
+
+    @headers["Content-Type"] = @content_type
+
     validate_format!
+
+    # Run named Timer as daemon thread
+    @timer = java.util.Timer.new("HTTP Output #{self.params['id']}", true)
   end # def register
 
-  # TODO: (colin) the request call sequence + async handling will have to be reworked when using
-  # Maticore >= 5.0. I will set a version constrain in the gemspec for this.
-  def receive(event)
-    return unless output?(event)
+  def multi_receive(events)
+    return if events.empty?
+    send_events(events)
+  end
 
-    body = event_body(event)
-
-    # Block waiting for a token
-    token = @request_tokens.pop
-
-    # Send the request
-    url = event.sprintf(@url)
-    headers = event_headers(event)
-
-    # Create an async request
-    request = client.send(@http_method, url, :body => body, :headers => headers, :async => true)
-
-    # with Maticore version < 0.5 using :async => true places the requests in an @async_requests
-    # list which is used & cleaned by Client#execute! but we are not using it here and we must
-    # purge it manually to avoid leaking requests.
-    client.clear_pending
-
-    # attach handlers before performing request
-
-    request.on_complete do
-      # Make sure we return the token to the pool
-      @request_tokens << token
+  class RetryTimerTask < java.util.TimerTask
+    def initialize(pending, event, attempt)
+      @pending = pending
+      @event = event
+      @attempt = attempt
+      super()
     end
 
-    request.on_success do |response|
-      if response.code < 200 || response.code > 299
-        log_failure(
-          "Encountered non-200 HTTP code #{200}",
-          :response_code => response.code,
-          :url => url,
-          :event => event)
+    def run
+      @pending << [@event, @attempt]
+    end
+  end
+
+  def log_retryable_response(response)
+    if (response.code == 429)
+      @logger.debug? && @logger.debug("Encountered a 429 response, will retry. This is not serious, just flow control via HTTP")
+    else
+      @logger.warn("Encountered a retryable HTTP request in HTTP output, will retry", :code => response.code, :body => response.body)
+    end
+  end
+
+  def log_error_response(response, url, event)
+    log_failure(
+              "Encountered non-2xx HTTP code #{response.code}",
+              :response_code => response.code,
+              :url => url,
+              :event => event
+            )
+  end
+
+  def send_events(events)
+    successes = java.util.concurrent.atomic.AtomicInteger.new(0)
+    failures  = java.util.concurrent.atomic.AtomicInteger.new(0)
+    retries = java.util.concurrent.atomic.AtomicInteger.new(0)
+    event_count = @is_batch ? 1 : events.size
+
+    pending = Queue.new
+    if @is_batch
+      pending << [events, 0]
+    else
+      events.each {|e| pending << [e, 0]}
+    end
+
+    while popped = pending.pop
+      break if popped == :done
+
+      event, attempt = popped
+
+      action, event, attempt = send_event(event, attempt)
+      begin
+        action = :failure if action == :retry && !@retry_failed
+
+        case action
+        when :success
+          successes.incrementAndGet
+        when :retry
+          retries.incrementAndGet
+
+          next_attempt = attempt+1
+          sleep_for = sleep_for_attempt(next_attempt)
+          @logger.info("Retrying http request, will sleep for #{sleep_for} seconds")
+          timer_task = RetryTimerTask.new(pending, event, next_attempt)
+          @timer.schedule(timer_task, sleep_for*1000)
+        when :failure
+          failures.incrementAndGet
+        else
+          raise "Unknown action #{action}"
+        end
+
+        if action == :success || action == :failure
+          if successes.get+failures.get == event_count
+            pending << :done
+          end
+        end
+      rescue => e
+        # This should never happen unless there's a flat out bug in the code
+        @logger.error("Error sending HTTP Request",
+          :class => e.class.name,
+          :message => e.message,
+          :backtrace => e.backtrace)
+        failures.incrementAndGet
+        raise e
       end
     end
+  rescue => e
+    @logger.error("Error in http output loop",
+            :class => e.class.name,
+            :message => e.message,
+            :backtrace => e.backtrace)
+    raise e
+  end
 
-    request.on_failure do |exception|
-      log_failure("Could not fetch URL",
-                  :url => url,
-                  :method => @http_method,
-                  :body => body,
-                  :headers => headers,
-                  :message => exception.message,
-                  :class => exception.class.name,
-                  :backtrace => exception.backtrace
-      )
+  def sleep_for_attempt(attempt)
+    sleep_for = attempt**2
+    sleep_for = sleep_for <= 60 ? sleep_for : 60
+    (sleep_for/2) + (rand(0..sleep_for)/2)
+  end
+
+  def send_event(event, attempt)
+    body = event_body(event)
+
+    # Send the request
+    url = @is_batch ? @url : event.sprintf(@url)
+    headers = @is_batch ? @headers : event_headers(event)
+
+    # Compress the body and add appropriate header
+    if @http_compression == true
+      headers["Content-Encoding"] = "gzip"
+      body = gzip(body)
+    end
+
+    # Create an async request
+    response = client.send(@http_method, url, :body => body, :headers => headers).call
+
+    if !response_success?(response)
+      if retryable_response?(response)
+        log_retryable_response(response)
+        return :retry, event, attempt
+      else
+        log_error_response(response, url, event)
+        return :failure, event, attempt
+      end
+    else
+      return :success, event, attempt
+    end
+
+  rescue => exception
+    will_retry = retryable_exception?(exception)
+    log_failure("Could not fetch URL",
+                :url => url,
+                :method => @http_method,
+                :body => body,
+                :headers => headers,
+                :message => exception.message,
+                :class => exception.class.name,
+                :backtrace => exception.backtrace,
+                :will_retry => will_retry
+    )
+
+    if will_retry
+      return :retry, event, attempt
+    else
+      return :failure, event, attempt
     end
 
     # Invoke it using the Manticore Executor (CachedThreadPool) directly
     request_async_background(request)
   end
 
+  def close
+    @timer.cancel
+    client.close
+  end
+
   private
+
+  def response_success?(response)
+    code = response.code
+    return true if @ignorable_codes && @ignorable_codes.include?(code)
+    return code >= 200 && code <= 299
+  end
+
+  def retryable_response?(response)
+    @retryable_codes && @retryable_codes.include?(response.code)
+  end
+
+  def retryable_exception?(exception)
+    RETRYABLE_MANTICORE_EXCEPTIONS.any? {|me| exception.is_a?(me) }
+  end
 
   # This is split into a separate method mostly to help testing
   def log_failure(message, opts)
     @logger.error("[HTTP Output Failure] #{message}", opts)
-  end
-
-  # Manticore doesn't provide a way to attach handlers to background or async requests well
-  # It wants you to use futures. The #async method kinda works but expects single thread batches
-  # and background only returns futures.
-  # Proposed fix to manticore here: https://github.com/cheald/manticore/issues/32
-  def request_async_background(request)
-    @method ||= client.executor.java_method(:submit, [java.util.concurrent.Callable.java_class])
-    @method.call(request)
   end
 
   # Format the HTTP body
@@ -167,18 +306,40 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
       LogStash::Json.dump(map_event(event))
     elsif @format == "message"
       event.sprintf(@message)
+    elsif @format == "json_batch"
+      LogStash::Json.dump(event.map {|e| map_event(e) })
     else
       encode(map_event(event))
     end
   end
 
-  def map_event(event)
-    if @mapping
-      @mapping.reduce({}) do |acc,kv|
-        k,v = kv
-        acc[k] = event.sprintf(v)
+  # gzip data
+  def gzip(data)
+    gz = StringIO.new
+    gz.set_encoding("BINARY")
+    z = Zlib::GzipWriter.new(gz)
+    z.write(data)
+    z.close
+    gz.string
+  end
+
+  def convert_mapping(mapping, event)
+    if mapping.is_a?(Hash)
+      mapping.reduce({}) do |acc, kv|
+        k, v = kv
+        acc[k] = convert_mapping(v, event)
         acc
       end
+    elsif mapping.is_a?(Array)
+      mapping.map { |elem| convert_mapping(elem, event) }
+    else
+      event.sprintf(mapping)
+    end
+  end
+
+  def map_event(event)
+    if @mapping
+      convert_mapping(@mapping, event)
     else
       # If the @timestamp key is present, make it the first key in the hash
       # See: https://community.aptible.com/t/sumologic-timestamp-parsing/237
@@ -194,9 +355,7 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
   end
 
   def event_headers(event)
-    headers = custom_headers(event) || {}
-    headers["Content-Type"] = @content_type
-    headers
+    custom_headers(event) || {}
   end
 
   def custom_headers(event)
