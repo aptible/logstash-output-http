@@ -88,6 +88,10 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
 
   config :message, :validate => :string
 
+  config :auth_user, :validate => :string
+
+  config :auth_password, :validate => :string
+
   def register
     @http_method = @http_method.to_sym
 
@@ -237,7 +241,14 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
     end
 
     # Create an async request
-    response = client.send(@http_method, url, :body => body, :headers => headers).call
+    params = { :body => body, :headers => headers }.tap do |params|
+      next if @auth_user.nil? && @auth_password.nil?
+
+      params[:auth] = {}
+      params[:auth][:user] = @auth_user unless @auth_user.nil?
+      params[:auth][:password] = @auth_password unless @auth_password.nil?
+    end
+    response = client.send(@http_method, url, **params).call
 
     if !response_success?(response)
       if retryable_response?(response)
