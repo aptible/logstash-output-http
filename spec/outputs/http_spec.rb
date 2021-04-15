@@ -288,6 +288,18 @@ describe LogStash::Outputs::Http do
 
     end
 
+    describe "sending batch to logdna" do
+      let(:config) do
+        base_config.merge({"url" => url, "http_method" => "post", "format" => "logdna_batch"})
+      end
+
+      let(:expected_body) { ::LogStash::Json.dump({ lines: events }) }
+      let(:events) { [::LogStash::Event.new("a" => 1), ::LogStash::Event.new("b" => 2)]}
+      let(:expected_content_type) { "application/json" }
+
+      include_examples("a received event")
+    end
+
     describe "sending the event as a form" do
       let(:config) {
         base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "format" => "form"})
